@@ -1299,7 +1299,7 @@ async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
 /* ============= 索引分块与存储函数 ============= */
 
 /**
- * 将索引分块并保存到数据库
+ * 将索引分块并保存到数据库 (已优化为串行写入，防止 Worker 超时)
  * @param {Object} context - 上下文对象，包含 env
  * @param {Object} index - 完整的索引对象
  * @returns {Promise<boolean>} 是否保存成功
@@ -1324,14 +1324,21 @@ async function saveChunkedIndex(context, index) {
             chunkCount: chunks.length,
             chunkSize: INDEX_CHUNK_SIZE
         };
+        // 必须先 await 元数据写入
         await db.put(INDEX_META_KEY, JSON.stringify(metadata));
 
-        // 3. 保存各个分块（并行）
-        const savePromises = chunks.map((chunk, chunkId) => {
+        // 3. 保存各个分块 (关键优化：串行写入 + 协作点)
+        for (let chunkId = 0; chunkId < chunks.length; chunkId++) {
+            const chunk = chunks[chunkId];
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
-            return db.put(chunkKey, JSON.stringify(chunk));
-        });
-        await Promise.all(savePromises);
+            console.log(`Saving chunk ${chunkId + 1}/${chunks.length}...`);
+            
+            // 串行等待每次写入完成
+            await db.put(chunkKey, JSON.stringify(chunk)); 
+            
+            // 关键：添加协作点，避免 CPU 时间片耗尽而中断
+            await new Promise(resolve => setTimeout(resolve, 0)); 
+        }
 
         // 4. 清理多余的旧分块（如果分块数量减少）
         await clearChunkedIndex(context, true, chunks.length);
@@ -1339,7 +1346,7 @@ async function saveChunkedIndex(context, index) {
         console.log(`Saved chunked index: ${chunks.length} chunks, ${files.length} total files`);
         return true;
     } catch (error) {
-        console.error('Error saving chunked index:', error);
+        console.error('Error saving chunked index (Fatal):', error);
         return false;
     }
 }
