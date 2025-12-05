@@ -915,6 +915,10 @@ async function getAllPendingOperations(context, lastOperationId = null) {
         fetchedOperations.forEach(operation => {
             if (operation) {
                 operations.push(operation);
+            } else {
+                // 确保任何获取或解析失败都会标记 isALL 为 false
+                // 这样在 mergeOperationsToIndex 中就能意识到还有潜在的后续工作
+                isALL = false;
             }
         });
 
