@@ -1124,7 +1124,6 @@ function extractDirectory(filePath) {
         return ''; // 根目录
     }
     return filePath.substring(0, lastSlashIndex + 1); // 包含最后的斜杠
-}
 
 /**
  * 将文件按时间戳倒序插入到已排序的数组中
