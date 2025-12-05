@@ -45,7 +45,7 @@ const KV_LIST_LIMIT = 1000; // 数据库列出批量大小
 const BATCH_SIZE = 10; // 批量处理大小
 
 // 【优化 1.1】新增冷却时间常量：30 秒内只合并一次原子操作
-const MERGE_COOLDOWN_MS = 30000; 
+const MERGE_COOLDOWN_MS = 0; 
 let lastMergeTimestamp = 0; // 模块级变量，记录上次合并的时间戳
 
 /**
