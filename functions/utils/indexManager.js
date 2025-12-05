@@ -51,6 +51,48 @@ const MERGE_COOLDOWN_MS = 30000;
 let lastMergeTimestamp = 0; // 模块级变量，记录上次合并的时间戳
 
 /**
+ * 检查是否需要进行索引合并或重建
+ * **这是前端用于判断是否返回“构建中”提示的关键函数**
+ * @param {Object} context - 上下文对象
+ * @returns {Promise<boolean>} 是否需要合并/重建
+ */
+export async function needsMergeOrRebuild(context) {
+    const { env } = context;
+    const db = getDatabase(env);
+    
+    // 检查是否有未处理的操作记录
+    const { keys: operationKeys } = await db.list({
+        prefix: OPERATION_KEY_PREFIX,
+        limit: 1
+    });
+    
+    // 如果有未处理的操作记录，则需要进行合并 (返回 true)
+    if (operationKeys.length > 0) {
+        return true;
+    }
+
+    // 检查索引元数据是否存在 (如果不存在，需要重建，返回 true)
+    const metadataStr = await db.get(INDEX_META_KEY);
+    if (!metadataStr) {
+        return true; 
+    }
+    
+    // 检查索引元数据是否显示为 "脏" 数据 (例如重建或合并失败)
+    try {
+        const metadata = JSON.parse(metadataStr);
+        // 如果 lastOperationId 不为 null，则说明上次操作未完成或未清理
+        if (metadata.lastOperationId !== null) {
+            return true;
+        }
+    } catch (e) {
+        console.error("Failed to parse metadata, requiring rebuild.");
+        return true;
+    }
+
+    return false; // 索引已就绪
+}
+
+/**
  * 导入文件到索引（原子操作）
  * @param {Object} context - 上下文对象
  * @param {string} fileId - 文件唯一 ID
