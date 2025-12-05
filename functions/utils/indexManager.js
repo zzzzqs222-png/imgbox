@@ -93,34 +93,38 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
         const { skipExisting = false } = options;
         const db = getDatabase(env);
 
-        // 处理每个文件的metadata
-        const processedFiles = [];
-        // 【优化提醒】：这段循环仍是串行调用 db.getWithMetadata，
-        // 如果能改为 Promise.all 或 db.batch 批量查询，性能会更好。
-        for (const fileItem of files) {
+        // 1. 构造一个 Promise 数组，用于并行获取元数据
+        const fetchMetadataPromises = files.map(fileItem => {
             const { fileId, metadata } = fileItem;
-            let finalMetadata = metadata;
+            
+            // 如果 metadata 已提供，立即解析并返回结果
+            if (metadata) {
+                return Promise.resolve({ fileId, metadata });
+            }
 
-            // 如果没有提供metadata，尝试从数据库中获取
-            if (!finalMetadata) {
+            // 如果 metadata 未提供，创建异步获取元数据的任务
+            return (async () => {
+                let finalMetadata = {};
                 try {
+                    // 并行调用 db.getWithMetadata
                     const fileData = await db.getWithMetadata(fileId);
                     finalMetadata = fileData.metadata || {};
                 } catch (error) {
                     console.warn(`Failed to get metadata for file ${fileId}:`, error);
                     finalMetadata = {};
                 }
-            }
+                
+                return { fileId, metadata: finalMetadata };
+            })();
+        });
 
-            processedFiles.push({
-                fileId,
-                metadata: finalMetadata
-            });
-        }
-
-        // 记录批量添加操作
+        // 2. 并行等待所有元数据获取任务完成
+        // fetchedFiles 的结构与 processedFiles 相同
+        const processedFiles = await Promise.all(fetchMetadataPromises);
+        
+        // 3. 记录批量添加操作（剩余逻辑不变）
         const operationId = await recordOperation(context, 'batch_add', {
-            files: processedFiles,
+            files: processedFiles, // 使用并行获取后的数据
             options: { skipExisting }
         });
 
@@ -1363,7 +1367,7 @@ async function saveChunkedIndex(context, index) {
             chunks.push(chunk);
         }
         
-        // 保存索引元数据
+        // 准备索引元数据
         const metadata = {
             lastUpdated: index.lastUpdated,
             totalCount: index.totalCount,
@@ -1372,16 +1376,26 @@ async function saveChunkedIndex(context, index) {
             chunkSize: INDEX_CHUNK_SIZE
         };
         
-        // 【优化提醒】：这里可以考虑将元数据和第一个块放入 db.batch 中一起写入，进一步减少 API 调用。
-        await db.put(INDEX_META_KEY, JSON.stringify(metadata));
+        // ------------------------------------------------------------
+        // 【优化】使用 Promise.all 并发写入元数据和所有分块
+        // ------------------------------------------------------------
         
-        // 保存各个分块
-        const savePromises = chunks.map((chunk, chunkId) => {
+        // 1. 初始化 Promise 数组
+        const allSavePromises = [];
+        
+        // 2. 将元数据写入 Promise 添加到数组中
+        allSavePromises.push(
+            db.put(INDEX_META_KEY, JSON.stringify(metadata))
+        );
+        
+        // 3. 将各个分块的写入 Promise 添加到数组中
+        chunks.forEach((chunk, chunkId) => {
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
-            return db.put(chunkKey, JSON.stringify(chunk));
+            allSavePromises.push(db.put(chunkKey, JSON.stringify(chunk)));
         });
         
-        await Promise.all(savePromises);
+        // 4. 并发等待所有写入操作完成
+        await Promise.all(allSavePromises);
         
         console.log(`Saved chunked index: ${chunks.length} chunks, ${files.length} total files`);
         return true;
@@ -1472,22 +1486,28 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
     try {
         console.log('Starting chunked index cleanup...');
         
-        // 获取元数据
+        // 1. 获取元数据并确定保留的键 (优化点：将 reservedChunks 转换为 Set)
         const metadataStr = await db.get(INDEX_META_KEY);
         let chunkCount = 0;
-        
+        const reservedChunks = new Set(); // 使用 Set 提高查找效率
+
         if (metadataStr) {
             const metadata = JSON.parse(metadataStr);
             chunkCount = metadata.chunkCount || 0;
 
             if (!onlyNonUsed) {
-                // 删除元数据
+                // 如果是完全清理模式，删除元数据
                 await db.delete(INDEX_META_KEY).catch(() => {});
+            } else {
+                // 如果仅清理未使用的分块，将当前在使用的分块键添加到 Set 中
+                for (let chunkId = 0; chunkId < chunkCount; chunkId++) {
+                    reservedChunks.add(`${INDEX_KEY}_${chunkId}`);
+                }
             }
         }
 
-        // 删除分块
-        const recordedChunks = []; // 现有的索引分块键
+        // 2. 收集所有以 INDEX_KEY 为前缀的键 (db.list 必须是串行的)
+        const recordedChunks = [];
         let cursor = null;
         while (true) {
             const response = await db.list({
@@ -1504,37 +1524,38 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
             if (!cursor) break;
         }
 
-        const reservedChunks = [];
-        if (onlyNonUsed) {
-            // 如果仅清理未使用的分块索引，保留当前在使用的分块
-            for (let chunkId = 0; chunkId < chunkCount; chunkId++) {
-                reservedChunks.push(`${INDEX_KEY}_${chunkId}`);
-            }
-        }
-
-        // 【优化提醒】：这里的删除逻辑可以考虑使用 db.batch() 进行优化，但由于涉及到 db.list() 的结果，
-        // 且需要判断保留的键，Promise.all 也是可接受的并发方式。
+        // 3. 【优化】 收集需要删除的 Promise (利用 Promise.all 的并发能力)
         const deletePromises = [];
+        let deletedCount = 0;
+        
         for (let chunkKey of recordedChunks) {
-            if (reservedChunks.includes(chunkKey) || !chunkKey.startsWith(INDEX_KEY + '_')) {
-                // 保留的分块和非分块键不删除
+            
+            const isReserved = reservedChunks.has(chunkKey);
+            
+            // 确保不会删除元数据键，除非是在完全清理模式下且元数据键在 recordedChunks 中
+            // 且 INDEX_META_KEY 已经在步骤 1 中被单独处理了，所以这里只需要处理分块和旧的 INDEX_KEY
+            if (chunkKey === INDEX_META_KEY) {
                 continue;
             }
 
+            if (onlyNonUsed && isReserved) {
+                // 保留的分块不删除
+                continue;
+            }
+            
+            // 删除所有非保留的键 (包括旧的 INDEX_KEY 键)
             deletePromises.push(
-                db.delete(chunkKey).catch(() => {})
+                db.delete(chunkKey).catch(error => {
+                    console.warn(`Failed to delete key ${chunkKey}:`, error.message);
+                })
             );
+            deletedCount++;
         }
 
-        if (recordedChunks.includes(INDEX_KEY)) {
-            deletePromises.push(
-                db.delete(INDEX_KEY).catch(() => {})
-            );
-        }
-
+        // 4. 并发执行所有删除操作
         await Promise.all(deletePromises);
         
-        console.log(`Chunked index cleanup completed. Attempted to delete ${chunkCount} chunks.`);
+        console.log(`Chunked index cleanup completed. Attempted to delete ${deletedCount} keys.`);
         return true;
         
     } catch (error) {
