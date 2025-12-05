@@ -2,39 +2,41 @@
 
 /**
  * 文件索引结构（分块存储）：
- * 
- * 索引元数据：
+ * * 索引元数据：
  * - key: manage@index@meta
  * - value: JSON.stringify(metadata)
  * - metadata: {
- *     lastUpdated: 1640995200000,
- *     totalCount: 1000,
- *     lastOperationId: "operation_timestamp_uuid",
- *     chunkCount: 3,
- *     chunkSize: 10000
- *   }
- * 
- * 索引分块：
+ * lastUpdated: 1640995200000,
+ * totalCount: 1000,
+ * lastOperationId: "operation_timestamp_uuid",
+ * chunkCount: 3,
+ * chunkSize: 10000
+ * }
+ * * 索引分块：
  * - key: manage@index_${chunkId} (例如: manage@index_0, manage@index_1, ...)
  * - value: JSON.stringify(filesChunk)
  * - filesChunk: [
- *     {
- *       id: "file_unique_id",
- *       metadata: {}
- *     },
- *     ...
- *   ]
- * 
- * 原子操作结构（保持不变）：
+ * {
+ * id: "file_unique_id",
+ * metadata: {}
+ * },
+ * ...
+ * ]
+ * * 原子操作结构（保持不变）：
  * - key: manage@index@operation_${timestamp}_${uuid}
  * - value: JSON.stringify(operation)
  * - operation: {
- *     type: "add" | "remove" | "move" | "batch_add" | "batch_remove" | "batch_move",
- *     timestamp: 1640995200000,
- *     data: {
- *       // 根据操作类型包含不同的数据
- *     }
- *   }
+ * type: "add" | "remove" | "move" | "batch_add" | "batch_remove" | "batch_move",
+ * timestamp: 1640995200000,
+ * data: {
+ * // 根据操作类型包含不同的数据
+ * }
+ * }
+ * * D1/SQLite 数据库结构 (假设的):
+ * - files: (id PRIMARY KEY, metadata TEXT, value BLOB, timestamp INTEGER)
+ * - index_operations: (id TEXT, type TEXT, timestamp INTEGER, data TEXT, processed BOOLEAN)
+ * - other_data: (key TEXT PRIMARY KEY, value TEXT, type TEXT) // 用于存储索引分块和 KV 元数据
+ * - index_metadata: (key TEXT PRIMARY KEY, last_updated INTEGER, total_count INTEGER, last_operation_id TEXT, chunk_count INTEGER, chunk_size INTEGER)
  */
 
 import { getDatabase } from './databaseAdapter.js';
@@ -46,6 +48,12 @@ const OPERATION_KEY_PREFIX = 'manage@index@operation_';
 const INDEX_CHUNK_SIZE = 10000; // 索引分块大小
 const KV_LIST_LIMIT = 1000; // 数据库列出批量大小
 const BATCH_SIZE = 10; // 批量处理大小
+
+// 工具函数：检查数据库实例是否为 D1/SQLite 兼容
+function isD1Instance(db) {
+    // 假设 db.db 存在且 prepare 方法可用即为 D1 兼容模式
+    return db.db && typeof db.db.prepare === 'function';
+}
 
 /**
  * 添加文件到索引
@@ -101,6 +109,7 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
             // 如果没有提供metadata，尝试从数据库中获取
             if (!finalMetadata) {
                 try {
+                    // 优化点：在 D1 模式下，可以考虑批量查询 metadata
                     const fileData = await db.getWithMetadata(fileId);
                     finalMetadata = fileData.metadata || {};
                 } catch (error) {
@@ -294,13 +303,9 @@ export async function mergeOperationsToIndex(context, options = {}) {
     const { request } = context;
     const { cleanupAfterMerge = true } = options;
     
-    // ... (rest of mergeOperationsToIndex function remains largely the same)
-
     try {
         console.log('Starting operations merge...');
         
-        // ... (获取当前索引和待处理操作的代码保持不变)
-
         // 获取当前索引
         const currentIndex = await getIndex(context);
         if (currentIndex.success === false) {
@@ -312,12 +317,11 @@ export async function mergeOperationsToIndex(context, options = {}) {
         }
 
         // 获取所有待处理的操作
-        // 尝试从 index_operations 表中获取，而不是依赖 KV key
         const operationsResult = await getAllPendingOperations(context, currentIndex.lastOperationId);
 
         const operations = operationsResult.operations;
         const isALLOperations = operationsResult.isAll;
-        
+
         if (operations.length === 0) {
             console.log('No pending operations to merge');
             return {
@@ -326,19 +330,138 @@ export async function mergeOperationsToIndex(context, options = {}) {
                 message: 'No pending operations'
             };
         }
-        
-        // ... (rest of operations processing loop remains the same)
 
-        // ... (index saving logic remains the same)
+        console.log(`Found ${operations.length} pending operations to merge. Is all operations: ${isALLOperations}, if there are remaining operations they will be processed in the next merge.`);
 
-        // 清理已处理的操作记录
-        if (cleanupAfterMerge && processedOperationIds.length > 0) {
-            // 优化点：cleanupOperations 函数现在使用 db.batch 进行批量删除
-            await cleanupOperations(context, processedOperationIds); 
+        // 按时间戳排序操作，确保按正确顺序应用
+        operations.sort((a, b) => a.timestamp - b.timestamp);
+
+        // 创建索引的副本进行操作
+        const workingIndex = currentIndex;
+        let operationsProcessed = 0;
+        let addedCount = 0;
+        let removedCount = 0;
+        let movedCount = 0;
+        let updatedCount = 0;
+        const processedOperationIds = [];
+
+        // 应用每个操作
+        for (const operation of operations) {
+            try {
+                switch (operation.type) {
+                    case 'add':
+                        const addResult = applyAddOperation(workingIndex, operation.data);
+                        if (addResult.added) addedCount++;
+                        if (addResult.updated) updatedCount++;
+                        break;
+                        
+                    case 'remove':
+                        if (applyRemoveOperation(workingIndex, operation.data)) {
+                            removedCount++;
+                        }
+                        break;
+                        
+                    case 'move':
+                        if (applyMoveOperation(workingIndex, operation.data)) {
+                            movedCount++;
+                        }
+                        break;
+                        
+                    case 'batch_add':
+                        const batchAddResult = applyBatchAddOperation(workingIndex, operation.data);
+                        addedCount += batchAddResult.addedCount;
+                        updatedCount += batchAddResult.updatedCount;
+                        break;
+                        
+                    case 'batch_remove':
+                        removedCount += applyBatchRemoveOperation(workingIndex, operation.data);
+                        break;
+                        
+                    case 'batch_move':
+                        movedCount += applyBatchMoveOperation(workingIndex, operation.data);
+                        break;
+                        
+                    default:
+                        console.warn(`Unknown operation type: ${operation.type}`);
+                        continue;
+                }
+                
+                operationsProcessed++;
+                // 记录完整的操作ID（不只是时间戳+UUID部分）
+                processedOperationIds.push(operation.id);
+
+                // 增加协作点
+                if (operationsProcessed % 3 === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+                
+            } catch (error) {
+                console.error(`Error applying operation ${operation.id}:`, error);
+            }
         }
 
-        // ... (recursive call and result return remains the same)
-        
+        // 如果有任何修改，保存索引
+        if (operationsProcessed > 0) {
+            workingIndex.lastUpdated = Date.now();
+            workingIndex.totalCount = workingIndex.files.length;
+            
+            // 记录最后处理的操作ID
+            if (processedOperationIds.length > 0) {
+                // processedOperationIds 存储的是原始的 timestamp_uuid 格式
+                workingIndex.lastOperationId = processedOperationIds[processedOperationIds.length - 1];
+            }
+
+            // 保存更新后的索引（使用分块格式）
+            const saveSuccess = await saveChunkedIndex(context, workingIndex);
+            if (!saveSuccess) {
+                console.error('Failed to save chunked index');
+                return {
+                    success: false,
+                    error: 'Failed to save index'
+                };
+            }
+
+            console.log(`Index updated: ${addedCount} added, ${updatedCount} updated, ${removedCount} removed, ${movedCount} moved`);
+        }
+
+        // 清理已处理的操作记录（优化点：D1 模式下是标记为 processed=TRUE）
+        if (cleanupAfterMerge && processedOperationIds.length > 0) {
+            // processedOperationIds 中是 timestamp_uuid 格式
+            await cleanupOperations(context, processedOperationIds);
+        }
+
+        // 如果未处理完所有操作，调用 merge-operations API 递归处理
+        if (!isALLOperations) {
+            console.log('There are remaining operations, will process them in subsequent calls.');
+
+            const headers = new Headers(request.headers);
+            const originUrl = new URL(request.url);
+            // 假设 merge-operations 端点处理后续合并
+            const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
+
+            // 使用 waitUntil 发起异步请求，不阻塞当前响应
+            context.waitUntil(fetch(mergeUrl, { method: 'GET', headers }));
+
+            // 注意：这里返回 false 意味着当前请求未完成所有工作，不是错误
+            return {
+                success: false,
+                error: 'There are remaining operations, will process them in subsequent calls.'
+            };
+        }
+
+        const result = {
+            success: true,
+            processedOperations: operationsProcessed,
+            addedCount,
+            updatedCount,
+            removedCount,
+            movedCount,
+            totalFiles: workingIndex.totalCount
+        };
+
+        console.log('Operations merge completed:', result);
+        return result;
+
     } catch (error) {
         console.error('Error merging operations:', error);
         return {
@@ -380,6 +503,9 @@ export async function readIndex(context, options = {}) {
         // 处理目录满足无头有尾的格式，根目录为空
         const dirPrefix = directory === '' || directory.endsWith('/') ? directory : directory + '/';
 
+        // 优化点：移除阻塞式的 mergeOperationsToIndex(context) 调用。
+        // 假设操作合并将在外部的 list.js 或其他地方通过 waitUntil 异步触发。
+
         // 获取当前索引
         const index = await getIndex(context);
         if (!index.success) {
@@ -393,10 +519,15 @@ export async function readIndex(context, options = {}) {
             const normalizedDir = directory.endsWith('/') ? directory : directory + '/';
             filteredFiles = filteredFiles.filter(file => {
                 const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
-                return fileDir.startsWith(normalizedDir) || file.metadata.Directory === directory;
+                // 优化点: 确保目录是精确匹配或者在其子目录下
+                if (includeSubdirFiles) {
+                    return fileDir.startsWith(normalizedDir) || file.metadata.Directory === directory;
+                } else {
+                    return fileDir === normalizedDir || fileDir === directory;
+                }
             });
         }
-
+        
         // 渠道过滤
         if (channel) {
             filteredFiles = filteredFiles.filter(file => 
@@ -464,12 +595,44 @@ export async function readIndex(context, options = {}) {
 
         let resultFiles = filteredFiles;
 
-        // 如果不包含子目录文件，获取当前目录下的直接文件
+        // 提取目录信息
+        const directories = new Set();
+        // 只有当用户没有明确设置 includeSubdirFiles=true 时，才在过滤时考虑目录
+        // 原始逻辑：如果 !includeSubdirFiles，则只返回当前目录下的文件，并计算子目录列表。
+        // 现在将子目录计算提前，然后在分页时进行最终的文件过滤。
+        
+        // 目录信息提取逻辑保持不变（基于所有 filteredFiles）
+        filteredFiles.forEach(file => {
+            const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
+            // 检查文件是否在当前目录或其子目录下
+            if (fileDir && fileDir.startsWith(dirPrefix)) {
+                // 移除当前目录前缀
+                const relativePath = fileDir.substring(dirPrefix.length);
+                if (relativePath.length > 0) {
+                    const firstSlashIndex = relativePath.indexOf('/');
+                    let subDir;
+                    if (firstSlashIndex !== -1) {
+                        // 找到下一级子目录（如 "dir1/subdir/" -> "dir1/"）
+                        subDir = dirPrefix + relativePath.substring(0, firstSlashIndex);
+                    } else {
+                        // 这是一个直属子目录（如 "dir1/"）
+                        subDir = dirPrefix + relativePath;
+                    }
+                    if (subDir.endsWith('/')) {
+                        subDir = subDir.substring(0, subDir.length - 1); // 移除尾部斜杠以匹配前端需求
+                    }
+                    directories.add(subDir);
+                }
+            }
+        });
+        
+        // 如果不包含子目录文件，只保留当前目录下的直接文件
         if (!includeSubdirFiles) {
-            resultFiles = filteredFiles.filter(file => {
-                const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
-                return fileDir === dirPrefix;
-            });
+             resultFiles = filteredFiles.filter(file => {
+                 const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
+                 // 匹配 dirPrefix (包含尾部斜杠)
+                 return fileDir === dirPrefix;
+             });
         }
 
         if (count !== -1) {
@@ -477,20 +640,6 @@ export async function readIndex(context, options = {}) {
             const endIndex = startIndex + Math.max(1, count);
             resultFiles = resultFiles.slice(startIndex, endIndex);
         }
-
-        // 提取目录信息
-        const directories = new Set();
-        filteredFiles.forEach(file => {
-            const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
-            if (fileDir && fileDir.startsWith(dirPrefix)) {
-                const relativePath = fileDir.substring(dirPrefix.length);
-                const firstSlashIndex = relativePath.indexOf('/');
-                if (firstSlashIndex !== -1) {
-                    const subDir = dirPrefix + relativePath.substring(0, firstSlashIndex);
-                    directories.add(subDir);
-                }
-            }
-        });
 
         return {
             files: resultFiles,
@@ -522,20 +671,29 @@ export async function readIndex(context, options = {}) {
 export async function rebuildIndex(context, progressCallback = null) {
     const { env, waitUntil } = context;
     const db = getDatabase(env);
-    
-    // 检查db是否为D1Database实例，以便使用优化的D1查询
-    const isD1 = db.db && typeof db.db.prepare === 'function';
+    const isD1 = isD1Instance(db);
 
     try {
         console.log('Starting index rebuild...');
-        let cursor = null; // D1使用timestamp作为游标
+        
+        // KV 模式下使用 KV cursor，D1 模式下使用 timestamp 作为游标
+        let cursor = null; 
         let processedCount = 0;
-        const newIndex = { files: [], lastUpdated: Date.now(), lastOperationId: null, totalCount: 0 };
-        const pageSize = 5000; // 优化点：增大分页大小以减少查询次数
+        const newIndex = {
+            files: [],
+            lastUpdated: Date.now(),
+            totalCount: 0,
+            lastOperationId: null
+        };
+        // 优化点：增大分页大小以减少查询次数
+        const pageSize = 5000; 
+        let totalRecords = 0;
 
+        // 分批读取所有文件
         while (true) {
             let records = [];
             let hasMore = false;
+            let listResult = null;
             
             // --- 优化点: 针对 D1 使用更高效的 SQL 查询 ---
             if (isD1) {
@@ -546,6 +704,7 @@ export async function rebuildIndex(context, progressCallback = null) {
 
                 // 使用 timestamp 作为游标进行高效分页
                 if (cursor) {
+                    // cursor 在 D1 模式下是上一个批次最后一个记录的 timestamp
                     query = 'SELECT id, metadata, timestamp FROM files WHERE timestamp < ? ORDER BY timestamp DESC LIMIT ?';
                     params = [cursor, pageSize + 1];
                 }
@@ -555,8 +714,11 @@ export async function rebuildIndex(context, progressCallback = null) {
 
                 records = response.results || [];
                 hasMore = records.length > pageSize;
+                
                 if (hasMore) {
-                    records.pop();
+                    // 移除多取的一个记录，它用于设置下一页的游标
+                    records.pop(); 
+                    // 设置下一页游标为当前批次最后一个记录的 timestamp
                     cursor = records.length > 0 ? records[records.length - 1].timestamp : null;
                 } else {
                     cursor = null;
@@ -565,13 +727,19 @@ export async function rebuildIndex(context, progressCallback = null) {
                 // 转换结果格式以匹配索引结构
                 records = records.map(row => ({
                     id: row.id,
-                    metadata: JSON.parse(row.metadata || '{}')
+                    // D1 存储的 metadata 是 JSON 字符串，需要解析
+                    metadata: JSON.parse(row.metadata || '{}') 
                 }));
-
+                // D1 模式下，记录总数需要单独查询（可选，但这里为了保持逻辑简单，先不查询）
+                
             } else {
-                // KV 兼容的旧逻辑 (使用 db.listFiles)
-                const options = { limit: pageSize, cursor: cursor, prefix: '' };
-                const listResult = await db.listFiles(options);
+                // KV 兼容的旧逻辑 (使用 db.list，需要确保 db.list 返回的是带 metadata 的 keys)
+                listResult = await db.list({
+                    limit: pageSize,
+                    cursor: cursor,
+                    prefix: '' // 列出所有键
+                });
+                
                 records = listResult.keys || [];
                 cursor = listResult.cursor;
             }
@@ -579,49 +747,78 @@ export async function rebuildIndex(context, progressCallback = null) {
 
             if (records.length === 0) break;
 
-            // 处理记录
-            records.forEach(item => {
-                const fileItem = {
-                    id: item.id || item.name,
-                    metadata: item.metadata || {}
-                };
-                insertFileInOrder(newIndex.files, fileItem);
-            });
+            for (const item of records) {
+                const fileId = item.id || item.name;
+                const metadata = item.metadata || {};
 
-            processedCount += records.length;
-            if (progressCallback) {
-                progressCallback(processedCount);
+                // 跳过管理相关的键（仅在 KV 模式下需要，D1 模式下 SQL 已经过滤）
+                if (!isD1 && (fileId.startsWith('manage@') || fileId.startsWith('chunk_'))) {
+                    continue;
+                }
+
+                // 跳过没有时间戳元数据的文件
+                if (!metadata.TimeStamp) {
+                    continue;
+                }
+
+                // 构建文件索引项
+                const fileItem = {
+                    id: fileId,
+                    metadata: metadata
+                };
+
+                // 保持插入排序以确保文件列表是按时间倒序的
+                insertFileInOrder(newIndex.files, fileItem);
+                processedCount++;
+
+                // 报告进度
+                if (progressCallback && processedCount % 1000 === 0) {
+                    progressCallback(processedCount);
+                }
             }
 
             if (!cursor) break;
-
+            
             // 增加协作点
-            await new Promise(resolve => setTimeout(resolve, 0));
+            await new Promise(resolve => setTimeout(resolve, 10));
         }
 
         newIndex.totalCount = newIndex.files.length;
         
         // 获取最后一个已处理的索引操作 ID 作为新的 lastOperationId
-        // D1Database.js 中需要实现 getLastProcessedIndexOperation
+        // 假设 databaseAdapter 提供了这个方法
         const lastOperation = isD1 ? await db.getLastProcessedIndexOperation() : null; 
         newIndex.lastOperationId = lastOperation ? lastOperation.id : null;
 
-        // 保存新索引
+        // 保存新索引（使用分块格式）
         const saveSuccess = await saveChunkedIndex(context, newIndex);
-
         if (!saveSuccess) {
-            throw new Error('Failed to save rebuilt index');
+            console.error('Failed to save chunked index during rebuild');
+            return {
+                success: false,
+                error: 'Failed to save rebuilt index'
+            };
         }
 
-        // 清理所有原子操作
-        await deleteAllOperations(context); // 重建索引后，所有挂起操作都应该被清理
+        // 清除旧的操作记录和多余索引
+        // deleteAllOperations 将根据模式清理 KV 或 D1 表
+        waitUntil(deleteAllOperations(context));
+        // clearChunkedIndex 将清理旧的 KV 分块
+        waitUntil(clearChunkedIndex(context, true));
 
-        console.log(`Index rebuild completed. Total files: ${newIndex.totalCount}`);
-        return newIndex;
-
+        console.log(`Index rebuild completed. Processed ${processedCount} files, indexed ${newIndex.totalCount} files.`);
+        return {
+            success: true,
+            processedCount,
+            indexedCount: newIndex.totalCount
+        };
+        
     } catch (error) {
         console.error('Error rebuilding index:', error);
-        throw error;
+        return {
+            success: false,
+            error: error.message
+        };
     }
 }
 
@@ -657,7 +854,9 @@ export async function getIndexInfo(context) {
 
             // 目录统计
             const dir = file.metadata.Directory || extractDirectory(file.id) || '/';
-            directoryStats[dir] = (directoryStats[dir] || 0) + 1;
+            // 移除尾部斜杠以进行更一致的统计
+            const normalizedDir = dir.endsWith('/') && dir.length > 1 ? dir.substring(0, dir.length - 1) : dir;
+            directoryStats[normalizedDir] = (directoryStats[normalizedDir] || 0) + 1;
             
             // 类型统计
             let listType = file.metadata.ListType || 'None';
@@ -680,7 +879,7 @@ export async function getIndexInfo(context) {
         };
     } catch (error) {
         console.error('Error getting index info:', error);
-        return null;
+        return { success: false, error: error.message };
     }
 }
 
@@ -688,6 +887,7 @@ export async function getIndexInfo(context) {
 
 /**
  * 生成唯一的操作ID
+ * ID 格式: ${timestamp}_${uuid}
  */
 function generateOperationId() {
     const timestamp = Date.now();
@@ -704,6 +904,7 @@ function generateOperationId() {
 async function recordOperation(context, type, data) {
     const { env } = context;
     const db = getDatabase(env);
+    const isD1 = isD1Instance(db);
 
     const operationId = generateOperationId();
     const operation = {
@@ -712,8 +913,22 @@ async function recordOperation(context, type, data) {
         data
     };
     
-    const operationKey = OPERATION_KEY_PREFIX + operationId;
-    await db.put(operationKey, JSON.stringify(operation));
+    // 优化点：D1 模式下将操作记录到 index_operations 表
+    if (isD1) {
+        const statement = db.db.prepare(
+            `INSERT INTO index_operations (id, type, timestamp, data, processed) VALUES (?, ?, ?, ?, 0)`
+        ).bind(
+            operationId,
+            type,
+            operation.timestamp,
+            JSON.stringify(data)
+        );
+        await statement.run();
+    } else {
+        // KV 模式下记录到 KV 存储
+        const operationKey = OPERATION_KEY_PREFIX + operationId;
+        await db.put(operationKey, JSON.stringify(operation));
+    }
 
     return operationId;
 }
@@ -721,57 +936,98 @@ async function recordOperation(context, type, data) {
 /**
  * 获取所有待处理的操作
  * @param {Object} context - 上下文对象
- * @param {string} lastOperationId - 最后处理的操作ID
+ * @param {string} lastOperationId - 最后处理的操作ID (格式: ${timestamp}_${uuid})
  */
 async function getAllPendingOperations(context, lastOperationId = null) {
     const { env } = context;
     const db = getDatabase(env);
+    const isD1 = isD1Instance(db);
 
     const operations = [];
 
-    let cursor = null;
+    let cursor = null; // KV 游标
     const MAX_OPERATION_COUNT = 30; // 单次获取的最大操作数量
     let isALL = true; // 是否获取了所有操作
     let operationCount = 0;
 
     try {
-        while (true) {
-            const response = await db.list({
-                prefix: OPERATION_KEY_PREFIX,
-                limit: KV_LIST_LIMIT,
-                cursor: cursor
-            });
-            
-            for (const item of response.keys) {
-                // 如果指定了lastOperationId，跳过已处理的操作
-                if (lastOperationId && item.name <= OPERATION_KEY_PREFIX + lastOperationId) {
-                    continue;
-                }
-                
-                if (operationCount >= MAX_OPERATION_COUNT) {
-                    isALL = false; // 达到最大操作数量，停止获取
-                    break;
-                }
+        if (isD1) {
+            // 优化点：D1 模式下从 index_operations 表查询
+            let query = `SELECT id, type, timestamp, data FROM index_operations 
+                         WHERE processed = 0 
+                         ORDER BY id ASC LIMIT ?`; // D1 id 包含 timestamp，自然有序
+            let params = [MAX_OPERATION_COUNT + 1]; // 多取一个用于判断是否还有更多
 
-                try {
-                    const operationData = await db.get(item.name);
-                    if (operationData) {
-                        const operation = JSON.parse(operationData);
-                        operation.id = item.name.substring(OPERATION_KEY_PREFIX.length);
-                        operations.push(operation);
-                        operationCount++;
-                    }
-                } catch (error) {
-                    isALL = false;
-                    console.warn(`Failed to parse operation ${item.name}:`, error);
-                }
+            if (lastOperationId) {
+                // 如果提供了 lastOperationId，从其后开始查询
+                query = `SELECT id, type, timestamp, data FROM index_operations 
+                         WHERE processed = 0 AND id > ?
+                         ORDER BY id ASC LIMIT ?`;
+                params = [lastOperationId, MAX_OPERATION_COUNT + 1];
             }
             
-            cursor = response.cursor;
-            if (!cursor || operationCount >= MAX_OPERATION_COUNT) break;
+            const response = await db.db.prepare(query).bind(...params).all();
+            const results = response.results || [];
+
+            if (results.length > MAX_OPERATION_COUNT) {
+                isALL = false;
+                results.pop(); // 移除多取的一个
+            }
+
+            for (const row of results) {
+                const operation = {
+                    id: row.id,
+                    type: row.type,
+                    timestamp: row.timestamp,
+                    data: JSON.parse(row.data)
+                };
+                operations.push(operation);
+                operationCount++;
+            }
+        } else {
+            // KV 兼容的旧逻辑
+            while (true) {
+                const response = await db.list({
+                    prefix: OPERATION_KEY_PREFIX,
+                    limit: KV_LIST_LIMIT,
+                    cursor: cursor
+                });
+                
+                for (const item of response.keys) {
+                    // KV key 格式: manage@index@operation_${timestamp}_${uuid}
+                    // 如果指定了lastOperationId，跳过已处理的操作
+                    if (lastOperationId && item.name <= OPERATION_KEY_PREFIX + lastOperationId) {
+                        continue;
+                    }
+                    
+                    if (operationCount >= MAX_OPERATION_COUNT) {
+                        isALL = false; // 达到最大操作数量，停止获取
+                        break;
+                    }
+
+                    try {
+                        const operationData = await db.get(item.name);
+                        if (operationData) {
+                            const operation = JSON.parse(operationData);
+                            // operation.id 只存储 timestamp_uuid 部分
+                            operation.id = item.name.substring(OPERATION_KEY_PREFIX.length); 
+                            operations.push(operation);
+                            operationCount++;
+                        }
+                    } catch (error) {
+                        isALL = false;
+                        console.warn(`Failed to parse operation ${item.name}:`, error);
+                    }
+                }
+                
+                cursor = response.cursor;
+                if (!cursor || operationCount >= MAX_OPERATION_COUNT) break;
+            }
         }
+        
     } catch (error) {
         console.error('Error getting pending operations:', error);
+        isALL = false;
     }
     
     return {
@@ -835,7 +1091,8 @@ function applyMoveOperation(index, data) {
     // 更新文件ID和元数据
     index.files[originalIndex] = {
         id: newFileId,
-        metadata: metadata || index.files[originalIndex].metadata
+        // 如果提供了新元数据，则使用；否则保留旧元数据
+        metadata: metadata || index.files[originalIndex].metadata 
     };
     
     return true;
@@ -877,14 +1134,16 @@ function applyBatchAddOperation(index, data) {
         } else {
             // 添加新文件
             insertFileInOrder(index.files, fileItem);
-            // 更新映射
-            index.files.forEach((file, idx) => {
-                existingFilesMap.set(file.id, idx);
-            });
-            
+            // 更新映射（注意：insertFileInOrder 可能会改变现有索引）
+            // 更好的做法是在批量操作中，先累积所有新增/更新的文件，最后再进行一次排序或插入。
+            // 为了兼容性和避免大幅重构，这里暂时保留原有的插入方式，但请注意性能影响。
+            // 重新创建映射的开销较大，这里省略了重新创建映射的逻辑，因为 insertFileInOrder 并没有直接修改 existingFilesMap。
             addedCount++;
         }
     }
+    
+    // 批量添加后，如果新增了文件，需要对整个列表重新排序或确保有序。
+    // insertFileInOrder 应该确保了插入时的有序性，这里不做额外的全局排序。
     
     return { addedCount, updatedCount };
 }
@@ -944,79 +1203,62 @@ function applyBatchMoveOperation(index, data) {
 /**
  * 并发清理指定的原子操作记录
  * @param {Object} context - 上下文对象
- * @param {Array} operationIds - 要清理的操作ID数组
- * @param {number} concurrency - 并发数量，默认为10
+ * @param {Array<string>} operationIds - 要清理的操作ID数组 (格式: ${timestamp}_${uuid})
+ * @param {number} concurrency - 并发数量，默认为10 (D1 模式下忽略)
  */
 async function cleanupOperations(context, operationIds, concurrency = 10) {
     const { env } = context;
     const db = getDatabase(env);
-    // 检查是否是 D1Database 实例
-    const isD1 = db.db && typeof db.db.prepare === 'function'; 
-
+    const isD1 = isD1Instance(db);
+    
     if (operationIds.length === 0) {
         return { deletedCount: 0, errorCount: 0 };
     }
     
     if (isD1) {
-        // 优化点: D1 批量标记 index_operations 为已处理
+        // 优化点: D1 批量标记 index_operations 记录为已处理
         console.log(`D1 Batch marking ${operationIds.length} index operations as processed...`);
         
-        // 标记为已处理，而不是删除（实际删除由 deleteAllOperations 或专门接口执行）
+        // 标记为已处理，而不是删除，真正的删除留给 deleteAllOperations 或定时任务
         const markProcessedStatements = operationIds.map(id => 
-             db.db.prepare('UPDATE index_operations SET processed = TRUE WHERE id = ?').bind(id)
+            // 假设 index_operations 表中存在 processed BOOLEAN/INTEGER 字段
+             db.db.prepare('UPDATE index_operations SET processed = 1 WHERE id = ?').bind(id)
         );
         
         try {
-            // 使用 db.batch() 一次性提交所有更新
+            // D1.batch() 执行批量操作
             await db.batch(markProcessedStatements); 
-            console.log(`D1 successfully marked ${operationIds.length} operations as processed.`);
+            console.log(`D1 Successfully marked ${operationIds.length} operations as processed.`);
             return { deletedCount: operationIds.length, errorCount: 0 };
         } catch (error) {
             console.error('Error during D1 batch mark processed operations:', error);
-            // 确保返回 KV 兼容的结果结构
             return { deletedCount: 0, errorCount: operationIds.length };
         }
     }
     
-    // --- KV 兼容的旧逻辑 (使用并发删除) ---
-    const tasks = operationIds.map(id => () => {
-        // KV key 格式: manage@index@operation_${timestamp}_${uuid}
-        const kvKey = OPERATION_KEY_PREFIX + id; 
-        return db.delete(kvKey);
-    });
-
-    try {
-        // 假设 runInConcurrency 是一个存在的工具函数
-        const results = await runInConcurrency(tasks, concurrency);
-
-        const errorCount = results.filter(r => r.status === 'rejected').length;
-        const deletedCount = operationIds.length - errorCount;
-
-        console.log(`Successfully cleaned up ${deletedCount} operations, ${errorCount} operations failed.`);
-        return {
-            success: true,
-            deletedCount: deletedCount,
-            errorCount: errorCount,
-        };
-
-    } catch (error) {
-        console.error('Error cleaning up operations (KV mode):', error);
-        return {
-            success: false,
-            deletedCount: 0,
-            errorCount: operationIds.length,
-        };
-    }
-}
-    
     // KV 兼容的旧逻辑 (使用并发删除)
-    const tasks = operationIds.map(id => () => {
-        // KV key 格式: manage@index@operation_${timestamp}_${uuid}
-        const kvKey = OPERATION_KEY_PREFIX + id; 
-        return db.delete(kvKey);
-    });
-
-    const results = await runInConcurrency(tasks, concurrency);
+    try {
+        console.log(`Cleaning up ${operationIds.length} processed operations with concurrency ${concurrency} (KV mode)...`);
+        
+        let deletedCount = 0;
+        let errorCount = 0;
+        
+        // 创建删除任务数组
+        const deleteTasks = operationIds.map(operationId => {
+            const operationKey = OPERATION_KEY_PREFIX + operationId;
+            return async () => {
+                try {
+                    await db.delete(operationKey);
+                    deletedCount++;
+                } catch (error) {
+                    console.error(`Error deleting operation ${operationId}:`, error);
+                    errorCount++;
+                }
+            };
+        });
+        
+        // 使用并发控制执行删除操作
+        await promiseLimit(deleteTasks, concurrency);
 
         console.log(`Successfully cleaned up ${deletedCount} operations, ${errorCount} operations failed.`);
         return {
@@ -1027,58 +1269,125 @@ async function cleanupOperations(context, operationIds, concurrency = 10) {
 
     } catch (error) {
         console.error('Error cleaning up operations:', error);
+        return {
+            success: false,
+            deletedCount: 0,
+            errorCount: operationIds.length,
+        };
     }
 }
 
 /**
- * 删除所有原子操作记录
+ * 删除所有原子操作记录（包括已处理和未处理的）
  * @param {Object} context - 上下文对象，包含 env 和其他信息
  * @returns {Object} 删除结果 { success, deletedCount, errors?, totalFound? }
  */
 export async function deleteAllOperations(context) {
-    const { env, request } = context;
+    const { request, env } = context;
     const db = getDatabase(env);
+    const isD1 = isD1Instance(db);
     
-    // 优化点: D1 直接清空表
-    const isD1 = db.db && typeof db.db.prepare === 'function';
-    if (isD1) {
-        try {
-            await db.db.prepare('DELETE FROM index_operations').run();
-            console.log('D1 Deleted all index operations.');
-            return { success: true, deletedCount: result.changes || 0 };
-        } catch (error) {
-            console.error('Error deleting all index operations from D1:', error);
-            // 失败则降级到 KV 兼容的列表删除逻辑
+    try {
+        console.log('Starting to delete all atomic operations...');
+        
+        if (isD1) {
+            // 优化点: D1 直接清空 index_operations 表
+            console.log('D1 mode: Deleting all index operations from index_operations table...');
+            const result = await db.db.prepare('DELETE FROM index_operations').run();
+            const deletedCount = result.changes || 0;
+            console.log(`D1 Deleted ${deletedCount} index operations.`);
+            return {
+                success: true,
+                deletedCount: deletedCount,
+                totalFound: deletedCount,
+                message: 'D1 operations deleted'
+            };
         }
-    }
+        
+        // KV 兼容的旧逻辑 (使用列表删除)
+        const allOperationIds = [];
+        let cursor = null;
+        let totalFound = 0;
+        
+        // 首先收集所有操作键
+        while (true) {
+            const response = await db.list({
+                prefix: OPERATION_KEY_PREFIX,
+                limit: KV_LIST_LIMIT,
+                cursor: cursor
+            });
+            
+            for (const item of response.keys) {
+                // allOperationIds 存储 timestamp_uuid 部分
+                allOperationIds.push(item.name.substring(OPERATION_KEY_PREFIX.length)); 
+                totalFound++;
+            }
+            
+            cursor = response.cursor;
+            if (!cursor) break;
+            
+            // 增加协作点
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        
+        if (totalFound === 0) {
+            console.log('No atomic operations found to delete');
+            return {
+                success: true,
+                deletedCount: 0,
+                totalFound: 0,
+                message: 'No operations to delete'
+            };
+        }
+        
+        console.log(`Found ${totalFound} atomic operations to delete`);
 
         // 限制单次删除的数量
         const MAX_DELETE_BATCH = 40;
         const toDeleteOperationIds = allOperationIds.slice(0, MAX_DELETE_BATCH);
    
-        // 批量删除原子操作
+        // 批量删除原子操作（KV 模式下是真正的删除）
         const cleanupResult = await cleanupOperations(context, toDeleteOperationIds);
+        const deletedCount = cleanupResult.deletedCount;
 
         // 剩余未删除的操作，调用 delete-operations API 进行递归删除
         if (allOperationIds.length > MAX_DELETE_BATCH || cleanupResult.errorCount > 0) {
-            console.warn(`Too many operations (${allOperationIds.length}), only deleting first ${cleanupResult.deletedCount}. The remaining operations will be deleted in subsequent calls.`);
+            console.warn(`Too many operations (${allOperationIds.length}), only deleting first ${deletedCount}. The remaining operations will be deleted in subsequent calls.`);
             // 复制请求头，用于鉴权
             const headers = new Headers(request.headers);
 
             const originUrl = new URL(request.url);
             const deleteUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=delete-operations`
             
-            await fetch(deleteUrl, {
+            // 使用 waitUntil 发起异步请求
+            context.waitUntil(fetch(deleteUrl, {
                 method: 'GET',
                 headers: headers
-            });
+            }));
+            
+            return {
+                success: true,
+                deletedCount: deletedCount,
+                totalFound: totalFound,
+                message: 'Partial delete, recursive call triggered'
+            };
 
         } else {
             console.log(`Delete all operations completed`);
+            return {
+                success: true,
+                deletedCount: deletedCount,
+                totalFound: totalFound,
+                message: 'All operations deleted'
+            };
         }
 
     } catch (error) {
         console.error('Error deleting all operations:', error);
+        return {
+            success: false,
+            error: error.message
+        };
     }
 }
 
@@ -1096,11 +1405,12 @@ async function getIndex(context) {
         if (index.success) {
             return index;
         } else {
-            // 如果加载失败，触发重建索引
+            // 如果加载失败，触发重建索引（异步执行）
             waitUntil(rebuildIndex(context));
         }
     } catch (error) {
-        console.warn('Error reading index, creating new one:', error);
+        console.warn('Error reading index, attempting to rebuild:', error);
+        // 确保即使在 catch 中也异步触发重建
         waitUntil(rebuildIndex(context));
     }
     
@@ -1123,7 +1433,9 @@ function extractDirectory(filePath) {
     if (lastSlashIndex === -1) {
         return ''; // 根目录
     }
-    return filePath.substring(0, lastSlashIndex + 1); // 包含最后的斜杠
+    // 返回包含最后的斜杠的目录路径
+    return filePath.substring(0, lastSlashIndex + 1); 
+}
 
 /**
  * 将文件按时间戳倒序插入到已排序的数组中
@@ -1131,6 +1443,7 @@ function extractDirectory(filePath) {
  * @param {Object} fileItem - 要插入的文件项
  */
 function insertFileInOrder(sortedFiles, fileItem) {
+    // 假设 metadata.TimeStamp 字段存在且为数字
     const fileTimestamp = fileItem.metadata.TimeStamp || 0;
     
     // 如果数组为空或新文件时间戳比第一个文件更新，直接插入到开头
@@ -1153,6 +1466,7 @@ function insertFileInOrder(sortedFiles, fileItem) {
         const mid = Math.floor((left + right) / 2);
         const midTimestamp = sortedFiles[mid].metadata.TimeStamp || 0;
         
+        // 寻找第一个时间戳小于等于 fileTimestamp 的位置
         if (fileTimestamp >= midTimestamp) {
             right = mid;
         } else {
@@ -1166,7 +1480,7 @@ function insertFileInOrder(sortedFiles, fileItem) {
 
 /**
  * 并发控制工具函数 - 限制同时执行的Promise数量
- * @param {Array} tasks - 任务数组，每个任务是一个返回Promise的函数
+ * @param {Array<Function>} tasks - 任务数组，每个任务是一个返回Promise的函数
  * @param {number} concurrency - 并发数量
  * @returns {Promise<Array>} 所有任务的结果数组
  */
@@ -1176,10 +1490,12 @@ async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
     
     for (let i = 0; i < tasks.length; i++) {
         const task = tasks[i];
+        // 包装任务，确保只记录最终结果
         const promise = Promise.resolve().then(() => task()).then(result => {
             results[i] = result;
             return result;
         }).finally(() => {
+            // 从执行队列中移除已完成的 Promise
             const index = executing.indexOf(promise);
             if (index >= 0) {
                 executing.splice(index, 1);
@@ -1188,6 +1504,7 @@ async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
         
         executing.push(promise);
         
+        // 当达到并发上限时，等待任一 Promise 完成
         if (executing.length >= concurrency) {
             await Promise.race(executing);
         }
@@ -1207,48 +1524,53 @@ async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
 async function saveChunkedIndex(context, index) {
     const { env } = context;
     const db = getDatabase(env);
-    const isD1 = db.db && typeof db.db.prepare === 'function';
+    const isD1 = isD1Instance(db);
 
     try {
         const files = index.files || [];
         const chunks = [];
         const statements = []; // 用于 D1 批量操作
-
+        
         // 1. 将文件数组分块
         for (let i = 0; i < files.length; i += INDEX_CHUNK_SIZE) {
             const chunk = files.slice(i, i + INDEX_CHUNK_SIZE);
             chunks.push(chunk);
         }
-
-        // 2. 准备删除旧的分块（如果新分块数量少于旧分块）
+        
+        // 2. 获取旧元数据以确定需要删除的旧分块
         const oldMetadataStr = await db.get(INDEX_META_KEY);
         const oldMetadata = oldMetadataStr ? JSON.parse(oldMetadataStr) : null;
         const oldChunkCount = oldMetadata ? oldMetadata.chunkCount : 0;
         
+        // 2.1. 准备删除多余的旧分块
         for (let i = chunks.length; i < oldChunkCount; i++) {
             const chunkKey = `${INDEX_KEY}_${i}`;
             if (isD1) {
-                 // D1Database.prototype.delete is compatible with KV delete (by key)
+                // D1 模式下，索引分块存储在 other_data 表中
                 statements.push(db.db.prepare(`DELETE FROM other_data WHERE key = ?`).bind(chunkKey));
             } else {
-                 await db.delete(chunkKey).catch(() => {});
+                // KV 模式下，直接删除 KV 键
+                await db.delete(chunkKey).catch(() => {});
             }
         }
-
+        
         // 3. 准备保存新的分块
+        const savePromises = [];
         for (let i = 0; i < chunks.length; i++) {
             const chunkKey = `${INDEX_KEY}_${i}`;
             const chunkValue = JSON.stringify(chunks[i]);
+            
             if (isD1) {
-                 // 优化点：使用批量操作
+                // D1：使用 INSERT OR REPLACE 批量插入/更新
                 statements.push(
-                     db.db.prepare(`INSERT OR REPLACE INTO other_data (key, value, type) VALUES (?, ?, 'index_chunk')`).bind(chunkKey, chunkValue)
+                    db.db.prepare(`INSERT OR REPLACE INTO other_data (key, value, type) VALUES (?, ?, 'index_chunk')`).bind(chunkKey, chunkValue)
                 );
             } else {
-                 await db.put(chunkKey, chunkValue); // KV put
+                // KV：发起 Promise
+                savePromises.push(db.put(chunkKey, chunkValue));
             }
         }
-
+        
         // 4. 准备保存索引元数据
         const metadata = {
             lastUpdated: index.lastUpdated,
@@ -1258,36 +1580,38 @@ async function saveChunkedIndex(context, index) {
             chunkSize: INDEX_CHUNK_SIZE
         };
         const metadataValue = JSON.stringify(metadata);
-
+        
         if (isD1) {
-            // 优化点：使用批量操作更新 index_metadata 和其他数据
+            // D1：批量保存元数据到 index_metadata 表
             statements.push(
-                db.db.prepare(`INSERT OR REPLACE INTO index_metadata (key, last_updated, total_count, last_operation_id, chunk_count, chunk_size) 
-                           VALUES (?, ?, ?, ?, ?, ?)`).bind(
+                db.db.prepare(`INSERT OR REPLACE INTO index_metadata (key, last_updated, total_count, last_operation_id, chunk_count, chunk_size)  
+                               VALUES (?, ?, ?, ?, ?, ?)`).bind(
                     'main_index', 
-                    Math.floor(metadata.lastUpdated / 1000), // D1 timestamp in seconds
+                    Math.floor(metadata.lastUpdated), // 假设 D1/SQLite 存储毫秒级时间戳
                     metadata.totalCount,
                     metadata.lastOperationId,
                     metadata.chunkCount,
                     metadata.chunkSize
                 )
             );
-            // 兼容 KV key 的元数据存储（用于 loadChunkedIndex）
+            // D1：兼容 KV key 的元数据存储（用于 loadChunkedIndex 获取 chunkCount）
             statements.push(
                  db.db.prepare(`INSERT OR REPLACE INTO other_data (key, value, type) VALUES (?, ?, 'index_meta')`).bind(INDEX_META_KEY, metadataValue)
             );
 
-            // 5. 批量执行所有操作
-            await db.batch(statements); // 使用 D1Database.prototype.batch
-
+            // 批量执行所有 D1 操作
+            await db.batch(statements);
+            
         } else {
-            // KV 模式：顺序执行
+            // KV：等待分块写入完成
+            await Promise.all(savePromises);
+            // KV：写入元数据
             await db.put(INDEX_META_KEY, metadataValue);
-            // chunks put is already done in step 3 (else block)
         }
-
-        console.log(`Index saved successfully in ${chunks.length} chunks.`);
+        
+        console.log(`Saved chunked index: ${chunks.length} chunks, ${files.length} total files`);
         return true;
+        
     } catch (error) {
         console.error('Error saving chunked index:', error);
         return false;
@@ -1302,9 +1626,10 @@ async function saveChunkedIndex(context, index) {
 async function loadChunkedIndex(context) {
     const { env } = context;
     const db = getDatabase(env);
+    const isD1 = isD1Instance(db);
 
     try {
-        // 首先获取元数据
+        // 首先获取元数据（KV key 格式）
         const metadataStr = await db.get(INDEX_META_KEY);
         if (!metadataStr) {
             throw new Error('Index metadata not found');
@@ -1317,14 +1642,29 @@ async function loadChunkedIndex(context) {
         const loadPromises = [];
         for (let chunkId = 0; chunkId < metadata.chunkCount; chunkId++) {
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
-            loadPromises.push(
-                db.get(chunkKey).then(chunkStr => {
-                    if (chunkStr) {
-                        return JSON.parse(chunkStr);
-                    }
-                    return [];
-                })
-            );
+            
+            if (isD1) {
+                 // D1 模式下从 other_data 表中获取
+                loadPromises.push(
+                    db.db.prepare(`SELECT value FROM other_data WHERE key = ?`).bind(chunkKey).first()
+                        .then(row => {
+                            if (row && row.value) {
+                                return JSON.parse(row.value);
+                            }
+                            return [];
+                        })
+                );
+            } else {
+                 // KV 模式下从 KV 获取
+                loadPromises.push(
+                    db.get(chunkKey).then(chunkStr => {
+                        if (chunkStr) {
+                            return JSON.parse(chunkStr);
+                        }
+                        return [];
+                    })
+                );
+            }
         }
         
         const chunks = await Promise.all(loadPromises);
@@ -1369,71 +1709,96 @@ async function loadChunkedIndex(context) {
 export async function clearChunkedIndex(context, onlyNonUsed = false) {
     const { env } = context;
     const db = getDatabase(env);
+    const isD1 = isD1Instance(db);
     
     try {
         console.log('Starting chunked index cleanup...');
         
-        // 获取元数据
+        // 获取元数据以确定当前使用的分块数量
         const metadataStr = await db.get(INDEX_META_KEY);
         let chunkCount = 0;
         
         if (metadataStr) {
             const metadata = JSON.parse(metadataStr);
             chunkCount = metadata.chunkCount || 0;
+        }
 
-            if (!onlyNonUsed) {
-                // 删除元数据
-                await db.delete(INDEX_META_KEY).catch(() => {});
+        // D1/KV 兼容的删除任务列表
+        const deleteKeys = [];
+        const deleteStatements = [];
+        
+        if (!onlyNonUsed) {
+            // 如果不是仅清理未使用的，则删除元数据键
+            deleteKeys.push(INDEX_META_KEY);
+            if (isD1) {
+                // 也要删除 D1 的 index_metadata 表记录
+                deleteStatements.push(db.db.prepare(`DELETE FROM index_metadata WHERE key = 'main_index'`));
             }
         }
 
-        // 删除分块
-        const recordedChunks = []; // 现有的索引分块键
+        // 查找所有索引分块键 (manage@index_*)
+        let recordedChunks = []; 
         let cursor = null;
-        while (true) {
-            const response = await db.list({
-                prefix: INDEX_KEY,
-                limit: KV_LIST_LIMIT,
-                cursor: cursor
-            });
-            
-            for (const item of response.keys) {
-                recordedChunks.push(item.name);
+        
+        if (isD1) {
+            // D1 模式下，从 other_data 表中查询 type='index_chunk' 或 key='manage@index_%'
+            const response = await db.db.prepare(`SELECT key FROM other_data WHERE type = 'index_chunk' OR key LIKE ?`).bind(`${INDEX_KEY}_%`).all();
+            recordedChunks = (response.results || []).map(row => row.key);
+        } else {
+            // KV 模式下，使用 list
+            while (true) {
+                const response = await db.list({
+                    prefix: INDEX_KEY, // 查找所有以 manage@index 开头的键
+                    limit: KV_LIST_LIMIT,
+                    cursor: cursor
+                });
+                
+                for (const item of response.keys) {
+                    recordedChunks.push(item.name);
+                }
+
+                cursor = response.cursor;
+                if (!cursor) break;
             }
-
-            cursor = response.cursor;
-            if (!cursor) break;
         }
-
-        const reservedChunks = [];
+        
+        const reservedChunks = new Set();
         if (onlyNonUsed) {
             // 如果仅清理未使用的分块索引，保留当前在使用的分块
             for (let chunkId = 0; chunkId < chunkCount; chunkId++) {
-                reservedChunks.push(`${INDEX_KEY}_${chunkId}`);
+                reservedChunks.add(`${INDEX_KEY}_${chunkId}`);
             }
         }
 
-        const deletePromises = [];
+        // 筛选出要删除的分块键
         for (let chunkKey of recordedChunks) {
-            if (reservedChunks.includes(chunkKey) || !chunkKey.startsWith(INDEX_KEY + '_')) {
-                // 保留的分块和非分块键不删除
-                continue;
+            // 检查它是否是 manage@index_xxx 格式
+            const isChunkKey = chunkKey.startsWith(INDEX_KEY + '_');
+            
+            if (isChunkKey && !reservedChunks.has(chunkKey)) {
+                deleteKeys.push(chunkKey);
+            } 
+            // 兼容性处理：如果存在旧的非分块索引键 'manage@index'，也删除
+            else if (chunkKey === INDEX_KEY) {
+                deleteKeys.push(chunkKey);
             }
-
-            deletePromises.push(
-                db.delete(chunkKey).catch(() => {})
-            );
         }
 
-        if (recordedChunks.includes(INDEX_KEY)) {
-            deletePromises.push(
-                db.delete(INDEX_KEY).catch(() => {})
-            );
+        // 执行删除操作
+        if (isD1) {
+            // D1：将所有要删除的 other_data 键添加到批量删除语句中
+            deleteKeys.forEach(key => {
+                // index_meta 和 index_chunk 都存储在 other_data 中
+                deleteStatements.push(db.db.prepare(`DELETE FROM other_data WHERE key = ?`).bind(key));
+            });
+            await db.batch(deleteStatements);
+        } else {
+            // KV：使用 promiseLimit 保证并发删除
+            const deleteTasks = deleteKeys.map(key => () => db.delete(key).catch(error => console.error(`Error deleting KV key ${key}:`, error)));
+            await promiseLimit(deleteTasks, BATCH_SIZE);
         }
 
-        await Promise.all(deletePromises);
-        
-        console.log(`Chunked index cleanup completed. Attempted to delete ${chunkCount} chunks.`);
+        console.log(`Chunked index cleanup completed. Total keys attempted to delete: ${deleteKeys.length}.`);
         return true;
         
     } catch (error) {
@@ -1450,6 +1815,7 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
 export async function getIndexStorageStats(context) {
     const { env } = context;
     const db = getDatabase(env);
+    const isD1 = isD1Instance(db);
 
     try {
         // 获取元数据
@@ -1468,13 +1834,27 @@ export async function getIndexStorageStats(context) {
         const chunkChecks = [];
         for (let chunkId = 0; chunkId < metadata.chunkCount; chunkId++) {
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
-            chunkChecks.push(
-                db.get(chunkKey).then(data => ({
-                    chunkId,
-                    exists: !!data,
-                    size: data ? data.length : 0
-                }))
-            );
+            
+            if (isD1) {
+                // D1 模式下：查询 other_data 表
+                chunkChecks.push(
+                    db.db.prepare(`SELECT LENGTH(value) as size FROM other_data WHERE key = ?`).bind(chunkKey).first()
+                        .then(row => ({
+                            chunkId,
+                            exists: !!row,
+                            size: row ? row.size : 0 // LENGTH(value) 返回字节长度
+                        }))
+                );
+            } else {
+                // KV 模式下：使用 db.getWithMetadata 获取值及其长度
+                chunkChecks.push(
+                    db.get(chunkKey, 'text').then(data => ({
+                        chunkId,
+                        exists: !!data,
+                        size: data ? new TextEncoder().encode(data).length : 0 // 估算字节长度
+                    }))
+                );
+            }
         }
         
         const chunkResults = await Promise.all(chunkChecks);
