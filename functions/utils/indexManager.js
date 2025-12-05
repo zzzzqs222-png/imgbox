@@ -958,23 +958,56 @@ async function cleanupOperations(context, operationIds, concurrency = 10) {
     }
     
     if (isD1) {
-        // 优化点: D1 批量删除 index_operations 记录
-        console.log(`D1 Batch deleting ${operationIds.length} index operations...`);
+        // 优化点: D1 批量标记 index_operations 为已处理
+        console.log(`D1 Batch marking ${operationIds.length} index operations as processed...`);
         
-        // 标记为已处理，而不是删除，以便于日志记录和获取最后一个操作ID
-        // 因为 delete-operations 接口会进行真正的删除，这里先标记已处理
+        // 标记为已处理，而不是删除（实际删除由 deleteAllOperations 或专门接口执行）
         const markProcessedStatements = operationIds.map(id => 
              db.db.prepare('UPDATE index_operations SET processed = TRUE WHERE id = ?').bind(id)
         );
         
         try {
+            // 使用 db.batch() 一次性提交所有更新
             await db.batch(markProcessedStatements); 
+            console.log(`D1 successfully marked ${operationIds.length} operations as processed.`);
             return { deletedCount: operationIds.length, errorCount: 0 };
         } catch (error) {
             console.error('Error during D1 batch mark processed operations:', error);
+            // 确保返回 KV 兼容的结果结构
             return { deletedCount: 0, errorCount: operationIds.length };
         }
     }
+    
+    // --- KV 兼容的旧逻辑 (使用并发删除) ---
+    const tasks = operationIds.map(id => () => {
+        // KV key 格式: manage@index@operation_${timestamp}_${uuid}
+        const kvKey = OPERATION_KEY_PREFIX + id; 
+        return db.delete(kvKey);
+    });
+
+    try {
+        // 假设 runInConcurrency 是一个存在的工具函数
+        const results = await runInConcurrency(tasks, concurrency);
+
+        const errorCount = results.filter(r => r.status === 'rejected').length;
+        const deletedCount = operationIds.length - errorCount;
+
+        console.log(`Successfully cleaned up ${deletedCount} operations, ${errorCount} operations failed.`);
+        return {
+            success: true,
+            deletedCount: deletedCount,
+            errorCount: errorCount,
+        };
+
+    } catch (error) {
+        console.error('Error cleaning up operations (KV mode):', error);
+        return {
+            success: false,
+            deletedCount: 0,
+            errorCount: operationIds.length,
+        };
+    }
+}
     
     // KV 兼容的旧逻辑 (使用并发删除)
     const tasks = operationIds.map(id => () => {
@@ -1012,7 +1045,7 @@ export async function deleteAllOperations(context) {
         try {
             await db.db.prepare('DELETE FROM index_operations').run();
             console.log('D1 Deleted all index operations.');
-            return;
+            return { success: true, deletedCount: result.changes || 0 };
         } catch (error) {
             console.error('Error deleting all index operations from D1:', error);
             // 失败则降级到 KV 兼容的列表删除逻辑
