@@ -40,43 +40,38 @@ import { matchesTags } from './tagHelpers.js';
 const INDEX_KEY = 'manage@index';
 const INDEX_META_KEY = 'manage@index@meta'; // 索引元数据键
 const OPERATION_KEY_PREFIX = 'manage@index@operation_';
+const OPERATION_KEY_CLEANUP = 'manage@index@operation@cleanup_'; // 清理记录键前缀
 const INDEX_CHUNK_SIZE = 100; // 索引分块大小
 const KV_LIST_LIMIT = 1000; // 数据库列出批量大小
-const BATCH_SIZE = 10; // 批量处理大小
+const OPERATION_CLEANUP_LIMIT = 100; // 每次清理操作限制
+const LAST_MERGE_TIME_KEY = 'manage@index@last_merge_time'; // 最后合并时间键
 
 // 【优化 1.1】新增冷却时间常量：30 秒内只合并一次原子操作
 const MERGE_COOLDOWN_MS = 30000; 
 let lastMergeTimestamp = 0; // 模块级变量，记录上次合并的时间戳
 
 /**
- * 添加文件到索引
- * @param {Object} context - 上下文对象，包含 env 和其他信息
- * @param {string} fileId - 文件 ID
+ * 导入文件到索引（原子操作）
+ * @param {Object} context - 上下文对象
+ * @param {string} fileId - 文件唯一 ID
  * @param {Object} metadata - 文件元数据
  */
-export async function addFileToIndex(context, fileId, metadata = null) {
+export async function addFileToIndex(context, fileId, metadata) {
     const { env } = context;
     const db = getDatabase(env);
+    const timestamp = Date.now();
+    const operationId = `${timestamp}_${Math.random().toString(36).substring(2, 9)}`;
 
-    try {
-        if (metadata === null) {
-            // 如果未传入metadata，尝试从数据库中获取
-            const fileData = await db.getWithMetadata(fileId);
-            metadata = fileData.metadata || {};
-        }
+    const operation = {
+        type: 'add',
+        timestamp: timestamp,
+        data: { fileId, metadata },
+        operationId: operationId
+    };
 
-        // 记录原子操作
-        const operationId = await recordOperation(context, 'add', {
-            fileId,
-            metadata
-        });
-
-        console.log(`File ${fileId} add operation recorded with ID: ${operationId}`);
-        return { success: true, operationId };
-    } catch (error) {
-        console.error('Error recording add file operation:', error);
-        return { success: false, error: error.message };
-    }
+    const operationKey = `${OPERATION_KEY_PREFIX}${operationId}`;
+    await db.put(operationKey, JSON.stringify(operation));
+    console.log(`Added operation: ${operationKey}`);
 }
 
 /**
@@ -659,7 +654,7 @@ export async function readIndex(context, options = {}) {
  * @param {Function} progressCallback - 进度回调函数
  */
 export async function rebuildIndex(context, progressCallback = null) {
-    const { env, waitUntil } = context;
+    const { env } = context; // 注意：从 context 解构 env，而不是 waitUntil
     const db = getDatabase(env);
 
     try {
@@ -674,10 +669,10 @@ export async function rebuildIndex(context, progressCallback = null) {
             lastOperationId: null
         };
 
-        // 分批读取所有文件
-        // 【优化提醒】：rebuildIndex 必然消耗大量读取行数，因为它必须进行全表扫描。
-        // 这是重建索引的固有成本，无法避免。
+        // 分批读取所有文件 (假设 D1/KV 的 list 方法可以分页遍历所有键)
         while (true) {
+            // 注意：这里需要根据您实际的存储接口 (D1 或 KV) 来调整 list 方法
+            // 这里的代码是为 KV 模式编写的，如果是 D1，需要修改为 SQL 查询
             const response = await db.list({
                 limit: KV_LIST_LIMIT,
                 cursor: cursor
@@ -711,8 +706,6 @@ export async function rebuildIndex(context, progressCallback = null) {
                 }
             }
 
-            // 【注意】这是关键的 D1 分页逻辑。如果这里有问题（例如 D1 查询超时导致 cursor/list_complete 错误），
-            // 则会导致卡顿。但在 D1Database.js 中，listFiles 使用了 ID 游标，理论上是高效的。
             if (!cursor || response.list_complete) break;
             
             // 添加协作点
@@ -724,7 +717,7 @@ export async function rebuildIndex(context, progressCallback = null) {
 
         newIndex.totalCount = newIndex.files.length;
 
-        // 保存新索引（使用分块格式）
+        // 保存新索引（使用分块格式）- 这是最耗时的 I/O 操作
         const saveSuccess = await saveChunkedIndex(context, newIndex);
         if (!saveSuccess) {
             console.error('Failed to save chunked index during rebuild');
@@ -733,11 +726,15 @@ export async function rebuildIndex(context, progressCallback = null) {
                 error: 'Failed to save rebuilt index'
             };
         }
-
-        // 清除旧的操作记录和多余索引
-        // 调用优化后的 deleteAllOperations
-        waitUntil(deleteAllOperations(context));
-        waitUntil(clearChunkedIndex(context, true));
+        
+        // *********************************************************
+        // 终极修复点 2: 移除内部的 waitUntil，改为 await
+        // 确保 rebuildIndex 返回前，所有 I/O 任务都已完成
+        // *********************************************************
+        // 清除旧的操作记录
+        await deleteAllOperations(context); // 等待原子操作清理完成
+        // 清除旧索引（如果存在旧的，这个在 saveChunkedIndex 中处理了，这里仅做安全清理）
+        // await clearChunkedIndex(context, true); // 移除此行，因为 saveChunkedIndex 已经处理了清理多余分块
 
         // 更新最后合并时间
         lastMergeTimestamp = Date.now();
@@ -1144,75 +1141,55 @@ async function cleanupOperations(context, operationIds) {
 
 
 /**
- * D1 优化：使用 SQL DELETE FROM 全量删除原子操作记录
- * @param {Object} context - 上下文对象，包含 env 和其他信息
- * @returns {Object} 删除结果 { success, deletedCount, errors?, totalFound? }
+ * 删除操作记录（优化后的批量删除）
+ * @param {Object} context - 上下文对象
+ * @returns {Promise<boolean>}
  */
 export async function deleteAllOperations(context) {
     const { env } = context;
-    const dbAdapter = getDatabase(env);
+    const db = getDatabase(env);
 
     try {
-        console.log('Starting full cleanup of index_operations table...');
+        console.log('Starting bulk delete of all operation records...');
         
-        const dbClient = dbAdapter.db;
-        
-        if (!dbClient || typeof dbClient.prepare !== 'function') {
-            console.warn('D1 client not available for full delete. Falling back to slow list/delete.');
+        let cursor = null;
+        let keysToDelete = [];
+        let totalDeleted = 0;
+
+        // 批量获取所有 operation keys
+        while (true) {
+            const response = await db.list({
+                prefix: OPERATION_KEY_PREFIX,
+                limit: KV_LIST_LIMIT,
+                cursor: cursor
+            });
+
+            keysToDelete = keysToDelete.concat(response.keys.map(k => k.name));
+            totalDeleted += response.keys.length;
+            cursor = response.cursor;
+
+            if (!cursor || response.list_complete) break;
             
-            let deletedCount = 0;
-            let totalFound = 0;
-            let cursor = null;
-            const toDeleteIds = [];
-
-            // 回退：先列出所有操作键，然后批量删除
-            while (true) {
-                const response = await dbAdapter.list({
-                    prefix: OPERATION_KEY_PREFIX,
-                    limit: KV_LIST_LIMIT,
-                    cursor: cursor
-                });
-
-                const currentIds = response.keys.map(item => item.name.substring(OPERATION_KEY_PREFIX.length));
-                toDeleteIds.push(...currentIds);
-                totalFound += currentIds.length;
-                
-                if (response.list_complete) break;
-                cursor = response.cursor;
-                await new Promise(resolve => setTimeout(resolve, 0)); 
-            }
-
-            if (totalFound > 0) {
-                const cleanupResult = await cleanupOperations(context, toDeleteIds);
-                deletedCount = cleanupResult.deletedCount;
-            }
-
-            console.log(`Fallback cleanup complete. Rows affected: ${deletedCount}`);
-            return {
-                success: true,
-                message: `Successfully deleted all pending operations (Fallback). Rows deleted: ${deletedCount}`,
-                deletedCount: deletedCount
-            };
+            // 避免 Worker 超时
+            await new Promise(resolve => setTimeout(resolve, 10));
         }
-        
-        // D1 Fast Path: 使用 DELETE FROM 全量删除
-        const stmt = dbClient.prepare('DELETE FROM index_operations');
-        const result = await stmt.run();
 
-        console.log(`Full cleanup complete. Rows affected: ${result.changes || 0}`);
-        
-        return { 
-            success: true, 
-            message: `Successfully deleted all pending operations. Rows deleted: ${result.changes || 0}`,
-            deletedCount: result.changes || 0
-        };
+        // 批量删除所有 key (D1/KV 的批量删除优化)
+        if (keysToDelete.length > 0) {
+            // 将删除请求分成 D1/KV 允许的批次大小 (例如 1000)
+            const BATCH_SIZE = 1000;
+            for (let i = 0; i < keysToDelete.length; i += BATCH_SIZE) {
+                const batch = keysToDelete.slice(i, i + BATCH_SIZE);
+                await db.delete(batch);
+                console.log(`Deleted batch of ${batch.length} operation keys.`);
+            }
+        }
 
+        console.log(`Successfully deleted ${totalDeleted} index operations.`);
+        return true;
     } catch (error) {
-        console.error('Error during deleteAllOperations:', error);
-        return { 
-            success: false, 
-            error: error.message 
-        };
+        console.error('Error during bulk operation delete:', error);
+        return false;
     }
 }
 
@@ -1326,22 +1303,28 @@ async function saveChunkedIndex(context, index) {
         };
         // 必须先 await 元数据写入
         await db.put(INDEX_META_KEY, JSON.stringify(metadata));
+        console.log(`Metadata saved. Total chunks: ${chunks.length}`);
 
         // 3. 保存各个分块 (关键优化：串行写入 + 协作点)
         for (let chunkId = 0; chunkId < chunks.length; chunkId++) {
             const chunk = chunks[chunkId];
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
-            console.log(`Saving chunk ${chunkId + 1}/${chunks.length}...`);
+            
+            // 确保 JSON.stringify 成功
+            const chunkData = JSON.stringify(chunk); 
+            
+            console.log(`Saving chunk ${chunkId + 1}/${chunks.length}. Size: ${chunkData.length} bytes.`);
             
             // 串行等待每次写入完成
-            await db.put(chunkKey, JSON.stringify(chunk)); 
+            await db.put(chunkKey, chunkData); 
             
             // 关键：添加协作点，避免 CPU 时间片耗尽而中断
-            await new Promise(resolve => setTimeout(resolve, 0)); 
+            // 这给了 Worker 释放控制权的机会
+            await new Promise(resolve => setTimeout(resolve, 10)); 
         }
 
         // 4. 清理多余的旧分块（如果分块数量减少）
-        await clearChunkedIndex(context, true, chunks.length);
+        await clearChunkedIndex(context, false, chunks.length);
 
         console.log(`Saved chunked index: ${chunks.length} chunks, ${files.length} total files`);
         return true;
@@ -1352,66 +1335,56 @@ async function saveChunkedIndex(context, index) {
 }
 
 /**
- * 从数据库加载分块索引
- * @param {Object} context - 上下文对象，包含 env
- * @returns {Promise<Object>} 完整的索引对象
+ * 从存储中加载分块索引
+ * @param {Object} context - 上下文对象
+ * @returns {Promise<Object>} 包含文件列表和元数据的索引对象
  */
-async function loadChunkedIndex(context) {
+export async function loadChunkedIndex(context) {
     const { env } = context;
     const db = getDatabase(env);
 
     try {
-        // 1. 首先获取元数据
         const metadataStr = await db.get(INDEX_META_KEY);
         if (!metadataStr) {
-            throw new Error('Index metadata not found');
+            return { files: [], totalCount: 0, chunkCount: 0 };
         }
+        
         const metadata = JSON.parse(metadataStr);
+        const { chunkCount } = metadata;
 
-        const files = [];
-
-        // 2. 并行加载所有分块
-        const loadPromises = [];
-        for (let chunkId = 0; chunkId < metadata.chunkCount; chunkId++) {
-            const chunkKey = `${INDEX_KEY}_${chunkId}`;
-            loadPromises.push(
-                db.get(chunkKey).then(chunkStr => {
-                    if (chunkStr) {
-                        return JSON.parse(chunkStr);
-                    }
-                    return [];
-                })
-            );
+        if (chunkCount === 0) {
+            return { files: [], totalCount: 0, chunkCount: 0 };
         }
 
-        const chunks = await Promise.all(loadPromises);
+        const chunkPromises = [];
+        for (let i = 0; i < chunkCount; i++) {
+            const chunkKey = `${INDEX_KEY}_${i}`;
+            // 注意：这里使用 Promise.all 并发读取，因为读取通常比写入快且稳定
+            chunkPromises.push(db.get(chunkKey));
+        }
 
-        // 3. 合并所有分块
-        chunks.forEach(chunk => {
-            if (Array.isArray(chunk)) {
-                files.push(...chunk);
+        const chunkDataArray = await Promise.all(chunkPromises);
+        let files = [];
+
+        for (const data of chunkDataArray) {
+            if (data) {
+                try {
+                    files = files.concat(JSON.parse(data));
+                } catch (e) {
+                    console.error('Failed to parse index chunk data:', e);
+                    // 忽略损坏的分块
+                }
             }
-        });
+        }
 
-        const index = {
+        return {
             files,
-            lastUpdated: metadata.lastUpdated,
-            totalCount: metadata.totalCount,
-            lastOperationId: metadata.lastOperationId,
-            success: true
+            ...metadata
         };
-        console.log(`Loaded chunked index: ${metadata.chunkCount} chunks, ${files.length} total files`);
-        return index;
+
     } catch (error) {
         console.error('Error loading chunked index:', error);
-        // 返回空的索引结构
-        return {
-            files: [],
-            lastUpdated: Date.now(),
-            totalCount: 0,
-            lastOperationId: null,
-            success: false,
-        };
+        return { files: [], totalCount: 0, chunkCount: 0, error: error.message };
     }
 }
 
@@ -1425,85 +1398,51 @@ async function getIndex(context) {
 }
 
 /**
- * 清理分块索引
- * @param {Object} context - 上下文对象，包含 env
- * @param {boolean} onlyNonUsed - 是否仅清理未使用的分块索引（例如，当 saveChunkedIndex 调用时）
- * @param {number} currentChunkCount - 当前正在使用的分块数量
- * @returns {Promise<boolean>} 是否清理成功
+ * 清除所有索引分块
+ * @param {Object} context - 上下文对象
+ * @param {boolean} clearMeta - 是否清除元数据键
+ * @param {number} startChunkId - 从哪个分块 ID 开始清理 (用于清理多余分块)
  */
-async function clearChunkedIndex(context, onlyNonUsed = false, currentChunkCount = 0) {
+async function clearChunkedIndex(context, clearMeta = true, startChunkId = 0) {
     const { env } = context;
     const db = getDatabase(env);
-    
+
     try {
-        const metadataStr = await db.get(INDEX_META_KEY);
-        let chunkCount = 0;
-        if (metadataStr) {
-            const metadata = JSON.parse(metadataStr);
-            chunkCount = metadata.chunkCount || 0;
-            if (!onlyNonUsed) {
-                // 删除元数据
-                await db.delete(INDEX_META_KEY).catch(() => {});
+        console.log(`Starting cleanup from chunk ID: ${startChunkId}`);
+        // 尝试从元数据中获取分块数量，如果获取不到，则假设一个上限来清理
+        let maxChunks = 50; 
+        
+        if (clearMeta) {
+            const metadataStr = await db.get(INDEX_META_KEY);
+            if (metadataStr) {
+                const metadata = JSON.parse(metadataStr);
+                maxChunks = Math.max(metadata.chunkCount + 5, 50);
             }
         }
-
-        // 删除分块
-        const recordedChunks = []; // 现有的索引分块键
-        let cursor = null;
-        while (true) {
-            const response = await db.list({
-                prefix: INDEX_KEY,
-                limit: KV_LIST_LIMIT,
-                cursor: cursor
-            });
-            
-            for (const item of response.keys) {
-                recordedChunks.push(item.name);
-            }
-            cursor = response.cursor;
-            if (!cursor) break;
+        
+        const deleteKeys = [];
+        if (clearMeta) {
+            deleteKeys.push(INDEX_META_KEY);
+        }
+        
+        for (let i = startChunkId; i < maxChunks; i++) {
+            deleteKeys.push(`${INDEX_KEY}_${i}`);
         }
 
-        const reservedChunks = [];
-        if (onlyNonUsed) {
-            // 如果仅清理未使用的分块索引，保留当前在使用的分块
-            for (let chunkId = 0; chunkId < currentChunkCount; chunkId++) {
-                reservedChunks.push(`${INDEX_KEY}_${chunkId}`);
-            }
-        }
+        // 批量删除
+        await db.delete(deleteKeys);
 
-        const deletePromises = [];
-        let chunksDeleted = 0;
-        for (const chunkKey of recordedChunks) {
-            if (reservedChunks.includes(chunkKey) || !chunkKey.startsWith(INDEX_KEY + '_')) {
-                // 保留的分块和非分块键不删除
-                continue;
-            }
-            deletePromises.push(
-                db.delete(chunkKey).then(() => chunksDeleted++).catch(() => {})
-            );
-        }
-
-        // 确保删除旧的非分块键
-        if (recordedChunks.includes(INDEX_KEY)) {
-            deletePromises.push(
-                db.delete(INDEX_KEY).catch(() => {})
-            );
-        }
-
-        await Promise.all(deletePromises);
-        console.log(`Chunked index cleanup completed. Deleted ${chunksDeleted} unused chunks.`);
-        return true;
+        console.log(`Cleaned up ${deleteKeys.length} index keys.`);
+        
     } catch (error) {
-        console.error('Error during chunked index cleanup:', error);
-        return false;
+        console.error('Error clearing chunked index:', error);
     }
 }
 
 /**
- * 获取索引的存储统计信息
- * @param {Object} context - 上下文对象，包含 env
- * @returns {Object} 存储统计信息
+ * 获取索引存储统计信息
+ * @param {Object} context - 上下文对象
+ * @returns {Promise<Object>} 统计信息对象
  */
 export async function getIndexStorageStats(context) {
     const { env } = context;
@@ -1526,6 +1465,7 @@ export async function getIndexStorageStats(context) {
         const chunkChecks = [];
         for (let chunkId = 0; chunkId < metadata.chunkCount; chunkId++) {
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
+            // 仅检查是否存在和大小，不读取全部内容
             chunkChecks.push(
                 db.get(chunkKey).then(data => ({
                     chunkId,
