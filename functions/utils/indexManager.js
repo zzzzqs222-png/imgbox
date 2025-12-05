@@ -40,9 +40,9 @@ import { matchesTags } from './tagHelpers.js';
 const INDEX_KEY = 'manage@index';
 const INDEX_META_KEY = 'manage@index@meta'; // 索引元数据键
 const OPERATION_KEY_PREFIX = 'manage@index@operation_';
-const INDEX_CHUNK_SIZE = 500; // 索引分块大小
+const INDEX_CHUNK_SIZE = 100; // 索引分块大小
 const KV_LIST_LIMIT = 1000; // 数据库列出批量大小
-const BATCH_SIZE = 100; // 批量处理大小
+const BATCH_SIZE = 10; // 批量处理大小
 
 // 【优化 1.1】新增冷却时间常量：30 秒内只合并一次原子操作
 const MERGE_COOLDOWN_MS = 30000; 
