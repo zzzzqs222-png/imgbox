@@ -299,6 +299,14 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
  * @param {boolean} options.cleanupAfterMerge - 合并后是否清理操作记录，默认为 true
  * @returns {Object} 合并结果
  */
+
+/**
+ * 合并所有挂起的操作到索引中
+ * @param {Object} context - 上下文对象
+ * @param {Object} options - 选项
+ * @param {boolean} options.cleanupAfterMerge - 合并后是否清理操作记录，默认为 true
+ * @returns {Object} 合并结果
+ */
 export async function mergeOperationsToIndex(context, options = {}) {
     const { request } = context;
     const { cleanupAfterMerge = true } = options;
@@ -324,8 +332,6 @@ export async function mergeOperationsToIndex(context, options = {}) {
 
         if (operations.length === 0) {
             console.log('No pending operations to merge');
-            // 更新最后合并时间，防止频繁检查
-            lastMergeTimestamp = Date.now(); 
             return {
                 success: true,
                 processedOperations: 0,
@@ -422,15 +428,11 @@ export async function mergeOperationsToIndex(context, options = {}) {
             }
 
             console.log(`Index updated: ${addedCount} added, ${updatedCount} updated, ${removedCount} removed, ${movedCount} moved`);
-        }
-        
-        // 【优化 1.3】更新最后合并时间
-        lastMergeTimestamp = Date.now();
-
-        // 清理已处理的操作记录
-        if (cleanupAfterMerge && processedOperationIds.length > 0) {
-            // 【优化 3】调用优化后的清理函数
-            await cleanupOperations(context, processedOperationIds);
+            
+            // ⭐ 优化点 1: 在成功保存后，立即清理当前批次已处理的操作记录 ⭐
+            if (cleanupAfterMerge && processedOperationIds.length > 0) {
+                await cleanupOperations(context, processedOperationIds);
+            }
         }
 
         // 如果未处理完所有操作，调用 merge-operations API 递归处理
@@ -441,12 +443,12 @@ export async function mergeOperationsToIndex(context, options = {}) {
             const originUrl = new URL(request.url);
             const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
 
-            // 使用 waitUntil 异步触发下一次合并，避免阻塞当前请求
-            waitUntil(fetch(mergeUrl, { method: 'GET', headers }));
+            // 等待下一次 fetch 完成 (在 Worker 的 waitUntil 范围内)
+            await fetch(mergeUrl, { method: 'GET', headers });
 
-            // 返回成功信息，而不是错误，因为操作已成功记录
+            // ⭐ 优化点 2: 当前批次处理成功，返回 success: true ⭐
             return {
-                success: true, 
+                success: true, // 修正状态，当前批次是成功的
                 processedOperations: operationsProcessed,
                 message: 'Operations processed, more pending tasks scheduled.'
             };
