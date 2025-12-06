@@ -1107,43 +1107,44 @@ function applyBatchMoveOperation(index, data) {
  * @param {Array} operationIds - 要清理的操作ID数组
  * @param {number} concurrency - 并发数量，默认为10
  */
+
 async function cleanupOperations(context, operationIds) {
     const { env } = context;
-    const db = getDatabase(env);
+    // 假设 getDatabase(env) 返回一个支持 db.delete(key) 的 KV 风格接口
+    const db = getDatabase(env); 
 
     try {
-        console.log(`Cleaning up ${operationIds.length} processed operations using db.batch...`);
+        // 关键修改 1: 更新日志，反映使用 KV 风格删除
+        console.log(`Cleaning up ${operationIds.length} processed operations using db.delete promises...`);
         
         let deletedCount = 0;
-        let errorCount = 0;
         
-        // 创建删除语句数组
-        const deleteStatements = operationIds.map(operationId => {
+        // 1. 创建删除操作的 Promise 数组
+        // 由于 db.delete 是异步操作，我们使用 Promise.all 来并发执行所有删除
+        const deletePromises = operationIds.map(operationId => {
+            // 构造完整的键（假设 OPERATION_KEY_PREFIX 已在文件顶部定义）
             const operationKey = OPERATION_KEY_PREFIX + operationId;
-            // 假设 db.delete 对应的 D1 SQL 是 DELETE FROM settings WHERE key = ?
-            return db.prepare('DELETE FROM settings WHERE key = ?').bind(operationKey); 
+            
+            // 关键修改 2: 使用 db.delete 方法执行删除
+            return db.delete(operationKey)
+                     .then(() => 1) // 删除成功，返回 1
+                     .catch(error => {
+                         // 捕获单个删除错误，记录错误信息，但不中断 Promise.all
+                         console.warn(`Failed to delete operation ${operationKey}:`, error.message);
+                         return 0; // 删除失败，返回 0
+                     });
         });
+
+        // 2. 并发等待所有删除操作完成
+        const results = await Promise.all(deletePromises);
         
-        // D1 的 db.batch 限制为 500 个语句
-        const MAX_BATCH_SIZE = 500;
-        const batches = [];
-        for (let i = 0; i < deleteStatements.length; i += MAX_BATCH_SIZE) {
-            batches.push(deleteStatements.slice(i, i + MAX_BATCH_SIZE));
-        }
+        // 统计结果
+        deletedCount = results.reduce((sum, count) => sum + count, 0);
+        const errorCount = operationIds.length - deletedCount;
 
-        // 顺序执行批次
-        for (const batch of batches) {
-            try {
-                // 【优化 3】一次 db.batch() 调用可以执行多达 500 个删除操作，大幅减少写入行数。
-                await db.batch(batch); 
-                deletedCount += batch.length;
-            } catch (error) {
-                console.error('Error executing batch delete:', error);
-                errorCount += batch.length;
-            }
-        }
+        // 关键修改 3: 更新完成日志
+        console.log(`Cleanup completed: ${deletedCount} operations successfully deleted, ${errorCount} operations failed.`);
 
-        console.log(`Successfully cleaned up ${deletedCount} operations, ${errorCount} operations failed.`);
         return {
             success: true,
             deletedCount: deletedCount,
@@ -1151,7 +1152,9 @@ async function cleanupOperations(context, operationIds) {
         };
 
     } catch (error) {
-        console.error('Error cleaning up operations:', error);
+        // 捕获致命错误（例如 db 对象本身的问题）
+        console.error('Fatal error during cleanup operations:', error);
+        return { success: false, deletedCount: 0, errorCount: operationIds.length };
     }
 }
 
